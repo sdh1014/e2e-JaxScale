@@ -56,7 +56,11 @@ class ModelConfig:
 
     def __post_init__(self):
         if self.head_dim is None:
-            self.head_dim = self.hidden_size // self.num_attention_heads
+            if self.is_mla:
+                # MLA: head_dim = qk_nope + qk_rope (for K), v_head_dim (for V)
+                self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+            else:
+                self.head_dim = self.hidden_size // self.num_attention_heads
 
     @property
     def is_moe(self) -> bool:

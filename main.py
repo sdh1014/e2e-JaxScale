@@ -27,6 +27,7 @@ def main():
     parser.add_argument("--max_new_tokens", type=int, default=128, help="Max tokens to generate")
     parser.add_argument("--tp", type=int, default=1, help="Tensor parallelism degree")
     parser.add_argument("--dp", type=int, default=1, help="Data parallelism degree")
+    parser.add_argument("--ep", type=int, default=1, help="Expert parallelism degree (MoE only)")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float32"])
     parser.add_argument("--benchmark", action="store_true", help="Run benchmark instead of generation")
     args = parser.parse_args()
@@ -39,7 +40,7 @@ def main():
     logger.info("Number of devices: %d", len(devices))
 
     # Create mesh
-    mesh = create_mesh(tp=args.tp, dp=args.dp)
+    mesh = create_mesh(tp=args.tp, dp=args.dp, ep=args.ep)
     logger.info("Mesh shape: %s", mesh.shape)
 
     # Load config
@@ -49,10 +50,16 @@ def main():
                 config.hidden_size, config.num_attention_heads,
                 config.num_key_value_heads)
 
-    # Initialize model
+    # Initialize model (select based on model type)
     logger.info("Initializing model...")
     t0 = time.time()
-    model = GLM4ForCausalLM(config, mesh, dtype=dtype)
+    if config.is_moe:
+        from models.glm4_flash import GLM4FlashForCausalLM
+        model = GLM4FlashForCausalLM(config, mesh, dtype=dtype)
+        logger.info("Using GLM-4.7-Flash (MoE + MLA)")
+    else:
+        model = GLM4ForCausalLM(config, mesh, dtype=dtype)
+        logger.info("Using GLM-4-9B (Dense + GQA)")
     logger.info("Model initialized in %.2fs", time.time() - t0)
 
     # Load weights
@@ -61,13 +68,12 @@ def main():
     model.load_weights(config)
     logger.info("Weights loaded in %.2fs", time.time() - t0)
 
-    # Shard weights across TP devices
-    if args.tp > 1:
-        from utils.weight_utils import shard_model_params
-        logger.info("Sharding model params for TP=%d ...", args.tp)
-        t0 = time.time()
-        shard_model_params(model, mesh)
-        logger.info("Params sharded in %.2fs", time.time() - t0)
+    # Shard weights across TP devices (also moves weights from CPU to device)
+    from utils.weight_utils import shard_model_params
+    logger.info("Sharding model params (TP=%d) ...", args.tp)
+    t0 = time.time()
+    shard_model_params(model, mesh)
+    logger.info("Params sharded in %.2fs", time.time() - t0)
 
     # Benchmark mode
     if args.benchmark:

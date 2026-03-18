@@ -80,17 +80,27 @@ def make_positions(seq_len: int, batch_size: int = 1) -> jax.Array:
 def _init_caches(model, batch_size: int, max_cache_len: int):
     """Create empty KV caches from model config.
 
-    When the model has a mesh with TP > 1, KV caches are sharded
-    along the num_kv_heads dimension.
+    Handles both GQA (GLM-4-9B) and MLA (GLM-4.7-Flash) cache shapes.
+    For MLA: K=[B,S,H,qk_head_dim], V=[B,S,H,v_head_dim] (both 256 for Flash).
     """
     config = model.config
     mesh = getattr(model, 'mesh', None)
+
+    if config.is_mla:
+        # MLA: K uses qk_nope+qk_rope, V uses v_head_dim
+        # For GLM-4.7-Flash both are 256, so head_dim works for both
+        num_kv_heads = config.num_attention_heads
+        head_dim = config.head_dim  # qk_nope + qk_rope = 256
+    else:
+        num_kv_heads = config.num_key_value_heads
+        head_dim = config.head_dim
+
     return init_kv_caches(
         batch_size=batch_size,
         max_seq_len=max_cache_len,
         num_layers=config.num_hidden_layers,
-        num_kv_heads=config.num_key_value_heads,
-        head_dim=config.head_dim,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
         dtype=model.dtype,
         mesh=mesh,
     )

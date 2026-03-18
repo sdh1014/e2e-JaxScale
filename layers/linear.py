@@ -42,12 +42,14 @@ class LinearBase(nnx.Module):
         self.params_dtype = params_dtype
         self.kernel_axes = kernel_axes or (None, None)
 
+        # Scalar placeholders — load_weights() replaces them before __call__.
+        # This avoids OOM when initializing large MoE models (64 experts × 46 layers).
         self.weight = nnx.Param(
-            jnp.zeros((input_size, output_size), dtype=params_dtype),
+            jnp.zeros((), dtype=params_dtype),
         )
         if use_bias:
             self.bias = nnx.Param(
-                jnp.zeros((output_size,), dtype=params_dtype),
+                jnp.zeros((), dtype=params_dtype),
             )
         else:
             self.bias = None

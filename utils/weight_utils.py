@@ -133,8 +133,8 @@ class WeightLoader:
         Handles both nnx.Param attributes and list indexing for layers.
         e.g. "model.layers.3.self_attn.q_proj.weight"
 
-        Frees the old GPU buffer before allocating the new one to
-        reduce peak GPU memory during weight loading.
+        Weights are placed on CPU during loading to avoid OOM on device.
+        shard_model_params() later moves them to the correct devices.
         """
         parts = target_path.split(".")
         obj = self.model
@@ -150,70 +150,99 @@ class WeightLoader:
         final_attr = parts[-1]
         current = getattr(obj, final_attr)
 
+        # Convert numpy to JAX array on CPU to avoid device OOM during loading
+        cpu = jax.devices("cpu")[0]
+        jax_value = jax.device_put(np.asarray(value_np, dtype=jnp.dtype(self.dtype)), cpu)
+
         if isinstance(current, nnx.Param):
-            # Free old GPU buffer first, then convert and assign new value
-            current.value = jnp.zeros((), dtype=jnp.float32)
-            current.value = jnp.asarray(value_np, dtype=self.dtype)
+            current.value = jnp.zeros((), dtype=jnp.float32)  # free old
+            current.value = jax_value
         else:
-            setattr(obj, final_attr, nnx.Param(jnp.asarray(value_np, dtype=self.dtype)))
+            setattr(obj, final_attr, nnx.Param(jax_value))
 
 
 def shard_model_params(model, mesh: jax.sharding.Mesh):
-    """Apply TP sharding to all model parameters based on kernel_axes.
+    """Apply TP sharding to all model parameters and move to devices.
 
-    Must be called after load_weights(). Walks the model tree and uses
-    jax.device_put to distribute each LinearBase weight (and bias) according
-    to its kernel_axes PartitionSpec. Embedding weights are replicated.
+    Must be called after load_weights(). Walks the model tree recursively
+    and uses jax.device_put to distribute each LinearBase weight (and bias)
+    according to its kernel_axes PartitionSpec. Non-sharded params are replicated.
+    Also handles moving weights from CPU to device for tp=1.
+
+    Works for both GLM-4-9B (Dense) and GLM-4.7-Flash (MoE + MLA).
 
     Args:
-        model: GLM4ForCausalLM instance with weights already loaded.
-        mesh: JAX device mesh (must have a "tensor" axis for TP).
+        model: Model instance with weights already loaded (possibly on CPU).
+        mesh: JAX device mesh.
     """
     from layers.linear import LinearBase
+    from layers.normalization import RMSNorm
 
     tp_size = mesh.shape.get("tensor", 1)
-    if tp_size <= 1:
-        logger.info("TP size is 1, skipping weight sharding")
-        return
 
-    sharded_count = 0
+    sharded_count = [0]  # mutable counter for nested function
+    replicated_2d = NamedSharding(mesh, P(None, None))
+    replicated_1d = NamedSharding(mesh, P(None))
 
-    for layer in model.model.layers:
-        # Attention projections
-        for proj in [layer.self_attn.q_proj, layer.self_attn.k_proj,
-                     layer.self_attn.v_proj, layer.self_attn.o_proj]:
-            _shard_linear(proj, mesh)
-            sharded_count += 1
+    def _walk_and_shard(module):
+        """Recursively walk module tree and apply sharding."""
+        if isinstance(module, LinearBase):
+            _shard_linear(module, mesh)
+            sharded_count[0] += 1
+            return
+        if isinstance(module, RMSNorm):
+            module.scale.value = jax.device_put(module.scale.value, replicated_1d)
+            return
 
-        # MLP projections
-        for proj in [layer.mlp.gate_proj, layer.mlp.up_proj, layer.mlp.down_proj]:
-            _shard_linear(proj, mesh)
-            sharded_count += 1
+        # Handle MoE stacked expert weights: P("expert", None, None)
+        from layers.moe import MoELayer
+        if isinstance(module, MoELayer):
+            ep_size = mesh.shape.get("expert", 1)
+            if ep_size > 1:
+                ep_pspec = P("expert", None, None)
+            else:
+                ep_pspec = P(None, None, None)
+            ep_sharding = NamedSharding(mesh, ep_pspec)
 
-    # Embedding and LMHead: replicate (P(None, None))
-    replicated = NamedSharding(mesh, P(None, None))
+            for attr in ("expert_gate_weight", "expert_up_weight", "expert_down_weight"):
+                param = getattr(module, attr)
+                if param.value.ndim == 3:  # [E, H, I] — loaded
+                    param.value = jax.device_put(param.value, ep_sharding)
+                    sharded_count[0] += 1
+
+            # Continue to recurse into gate, shared_experts, etc.
+
+        # Recurse into children
+        for name in vars(module):
+            child = getattr(module, name, None)
+            if child is None:
+                continue
+            if isinstance(child, nnx.Param):
+                # Move any remaining CPU params to device (replicated)
+                if hasattr(child.value, 'devices') and not any(
+                    d.platform != 'cpu' for d in child.value.devices()
+                ):
+                    child.value = jax.device_put(child.value,
+                                                 NamedSharding(mesh, P(*([None] * child.value.ndim))))
+            elif isinstance(child, (nnx.Module, LinearBase, RMSNorm)):
+                _walk_and_shard(child)
+            elif isinstance(child, (list, nnx.List)):
+                for item in child:
+                    if isinstance(item, nnx.Module):
+                        _walk_and_shard(item)
+
+    _walk_and_shard(model)
+
+    # Embedding and LMHead: replicate
     model.model.embed_tokens.embedding.value = jax.device_put(
-        model.model.embed_tokens.embedding.value, replicated
+        model.model.embed_tokens.embedding.value, replicated_2d
     )
     if model.lm_head is not None:
         model.lm_head.embedding.value = jax.device_put(
-            model.lm_head.embedding.value, replicated
+            model.lm_head.embedding.value, replicated_2d
         )
 
-    # RMSNorm scales: replicate (P(None))
-    replicated_1d = NamedSharding(mesh, P(None))
-    model.model.norm.scale.value = jax.device_put(
-        model.model.norm.scale.value, replicated_1d
-    )
-    for layer in model.model.layers:
-        layer.input_layernorm.scale.value = jax.device_put(
-            layer.input_layernorm.scale.value, replicated_1d
-        )
-        layer.post_attention_layernorm.scale.value = jax.device_put(
-            layer.post_attention_layernorm.scale.value, replicated_1d
-        )
-
-    logger.info("Sharded %d linear layers across TP=%d devices", sharded_count, tp_size)
+    logger.info("Sharded %d linear layers across TP=%d devices", sharded_count[0], tp_size)
 
 
 def _shard_linear(linear, mesh: jax.sharding.Mesh):
