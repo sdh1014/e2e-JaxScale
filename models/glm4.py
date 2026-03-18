@@ -12,6 +12,7 @@ from flax import nnx
 from configs.model_config import ModelConfig
 from layers.attention import GQAAttention
 from layers.embedding import Embed, ParallelLMHead
+from layers.kv_cache import KVCache
 from layers.linear import LinearBase
 from layers.normalization import RMSNorm
 
@@ -98,21 +99,28 @@ class GLM4DecoderLayer(nnx.Module):
         hidden_states: jax.Array,
         positions: jax.Array,
         attention_mask: jax.Array | None = None,
-    ) -> jax.Array:
+        kv_cache: KVCache | None = None,
+        cache_position: jax.Array | None = None,
+    ) -> tuple[jax.Array, KVCache | None]:
         """Forward pass with pre-norm and residual connections.
 
         Args:
             hidden_states: [batch, seq_len, hidden_size]
             positions: [batch, seq_len]
-            attention_mask: [batch, 1, seq_len, seq_len]
+            attention_mask: [batch, 1, seq_len, kv_len]
+            kv_cache: Optional per-layer KV cache.
+            cache_position: [seq_len] write indices into cache.
 
         Returns:
-            hidden_states: [batch, seq_len, hidden_size]
+            (hidden_states, kv_cache)
         """
         # Self-attention with pre-norm and residual
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, positions, attention_mask)
+        hidden_states, kv_cache = self.self_attn(
+            hidden_states, positions, attention_mask,
+            kv_cache=kv_cache, cache_position=cache_position,
+        )
         hidden_states = residual + hidden_states
 
         # MLP with pre-norm and residual
@@ -121,7 +129,7 @@ class GLM4DecoderLayer(nnx.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        return hidden_states
+        return hidden_states, kv_cache
 
 
 class GLM4Model(nnx.Module):
@@ -155,24 +163,35 @@ class GLM4Model(nnx.Module):
         input_ids: jax.Array,
         positions: jax.Array,
         attention_mask: jax.Array | None = None,
-    ) -> jax.Array:
+        kv_caches: list[KVCache] | None = None,
+        cache_position: jax.Array | None = None,
+    ) -> tuple[jax.Array, list[KVCache] | None]:
         """Forward pass through the full model backbone.
 
         Args:
             input_ids: [batch, seq_len] token IDs.
             positions: [batch, seq_len] position indices.
-            attention_mask: [batch, 1, seq_len, seq_len] causal mask.
+            attention_mask: [batch, 1, seq_len, kv_len] mask.
+            kv_caches: List of per-layer KV caches (len = num_layers). None = no caching.
+            cache_position: [seq_len] write indices into cache.
 
         Returns:
-            hidden_states: [batch, seq_len, hidden_size]
+            (hidden_states, kv_caches)
         """
         hidden_states = self.embed_tokens(input_ids)
 
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, positions, attention_mask)
+        new_caches = []
+        for i, layer in enumerate(self.layers):
+            layer_cache = kv_caches[i] if kv_caches is not None else None
+            hidden_states, layer_cache = layer(
+                hidden_states, positions, attention_mask,
+                kv_cache=layer_cache, cache_position=cache_position,
+            )
+            new_caches.append(layer_cache)
 
         hidden_states = self.norm(hidden_states)
-        return hidden_states
+        out_caches = new_caches if kv_caches is not None else None
+        return hidden_states, out_caches
 
 
 class GLM4ForCausalLM(nnx.Module):
@@ -207,18 +226,25 @@ class GLM4ForCausalLM(nnx.Module):
         input_ids: jax.Array,
         positions: jax.Array,
         attention_mask: jax.Array | None = None,
-    ) -> jax.Array:
+        kv_caches: list[KVCache] | None = None,
+        cache_position: jax.Array | None = None,
+    ) -> tuple[jax.Array, list[KVCache] | None]:
         """Forward pass returning logits.
 
         Args:
             input_ids: [batch, seq_len]
             positions: [batch, seq_len]
-            attention_mask: [batch, 1, seq_len, seq_len]
+            attention_mask: [batch, 1, seq_len, kv_len]
+            kv_caches: List of per-layer KV caches. None = no caching.
+            cache_position: [seq_len] write indices into cache.
 
         Returns:
-            logits: [batch, seq_len, vocab_size]
+            (logits, kv_caches): logits [batch, seq_len, vocab_size]
         """
-        hidden_states = self.model(input_ids, positions, attention_mask)
+        hidden_states, kv_caches = self.model(
+            input_ids, positions, attention_mask,
+            kv_caches=kv_caches, cache_position=cache_position,
+        )
 
         if self.lm_head is not None:
             logits = self.lm_head(hidden_states)
@@ -229,7 +255,7 @@ class GLM4ForCausalLM(nnx.Module):
                 hidden_states.astype(self.dtype),
                 self.model.embed_tokens.embedding.value,
             )
-        return logits
+        return logits, kv_caches
 
     def load_weights(self, model_config: ModelConfig):
         """Load weights from HuggingFace safetensors."""

@@ -13,7 +13,7 @@ import jax.numpy as jnp
 
 from configs.model_config import ModelConfig
 from models.glm4 import GLM4ForCausalLM
-from runner import greedy_generate
+from runner import greedy_generate, JittedModel
 from utils.mesh_utils import create_mesh
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -63,7 +63,7 @@ def main():
 
     # Benchmark mode
     if args.benchmark:
-        from benchmark import run_benchmark, print_summary
+        from benchmarks.benchmark import run_benchmark, print_summary
         result = run_benchmark(
             model, config, args.tp, args.dp, dtype,
             batch_sizes=[1],
@@ -96,7 +96,7 @@ def main():
     seq_len = input_ids.shape[1]
     positions = make_positions(seq_len, input_ids.shape[0])
     mask = make_causal_mask(seq_len, dtype=dtype)
-    logits = model(input_ids, positions, mask)
+    logits, _ = model(input_ids, positions, mask)
     first_logits = logits[0, -1, :]  # last position logits
     top5_indices = jnp.argsort(first_logits)[-5:][::-1]
     top5_values = first_logits[top5_indices]
@@ -105,11 +105,17 @@ def main():
         token_str = tokenizer.decode([idx])
         logger.info("  token_id=%d, logit=%.4f, text=%r", idx, val, token_str)
 
+    # JIT compile model for inference
+    jitted_model = JittedModel(model)
+    max_cache_len = seq_len + args.max_new_tokens
+    jitted_model.warmup(batch_size=1, prompt_len=seq_len, max_cache_len=max_cache_len)
+
     t0 = time.time()
     output_ids = greedy_generate(
-        model,
+        jitted_model,
         input_ids,
         max_new_tokens=args.max_new_tokens,
+        max_cache_len=max_cache_len,
         eos_token_id=tokenizer.eos_token_id,
     )
     gen_time = time.time() - t0

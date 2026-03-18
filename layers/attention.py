@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+from layers.kv_cache import KVCache
 from layers.linear import LinearBase
 from layers.rotary import RotaryEmbedding
 
@@ -77,17 +78,25 @@ class GQAAttention(nnx.Module):
         hidden_states: jax.Array,
         positions: jax.Array,
         attention_mask: jax.Array | None = None,
-    ) -> jax.Array:
+        kv_cache: KVCache | None = None,
+        cache_position: jax.Array | None = None,
+    ) -> tuple[jax.Array, KVCache | None]:
         """Forward pass.
 
         Args:
             hidden_states: [batch, seq_len, hidden_size]
             positions: [batch, seq_len] position indices
-            attention_mask: [batch, 1, seq_len, seq_len] causal mask
-                            0 = attend, -inf = mask out
+            attention_mask: [batch, 1, seq_len, kv_len] mask (0=attend, -1e9=mask)
+                Prefill: [B, 1, S, max_seq_len] or [B, 1, S, S]
+                Decode:  [B, 1, 1, max_seq_len]
+            kv_cache: Optional per-layer KV cache. None = no caching.
+            cache_position: [seq_len] indices into cache to write new K/V.
+                Prefill: [0, 1, ..., prompt_len-1]
+                Decode:  [cur_pos]
 
         Returns:
-            output: [batch, seq_len, hidden_size]
+            (output, kv_cache): output [batch, seq_len, hidden_size],
+                updated kv_cache (None if input kv_cache was None).
         """
         batch, seq_len, _ = hidden_states.shape
 
@@ -112,24 +121,43 @@ class GQAAttention(nnx.Module):
         q = q_flat.reshape(batch, seq_len, self.num_heads, self.head_dim)
         k = k_flat.reshape(batch, seq_len, self.num_kv_heads, self.head_dim)
 
-        # Repeat KV heads for GQA: [B, S, num_kv_heads, hd] -> [B, S, num_heads, hd]
-        if self.num_kv_groups > 1:
-            k = jnp.repeat(k, self.num_kv_groups, axis=2)
-            v = jnp.repeat(v, self.num_kv_groups, axis=2)
+        # --- KV Cache update ---
+        if kv_cache is not None:
+            # Write new k, v into cache at cache_position
+            k_cache = jax.lax.dynamic_update_slice(
+                kv_cache.k, k, (0, cache_position[0], 0, 0),
+            )
+            v_cache = jax.lax.dynamic_update_slice(
+                kv_cache.v, v, (0, cache_position[0], 0, 0),
+            )
+            kv_cache = KVCache(k=k_cache, v=v_cache)
 
-        # Transpose to [B, num_heads, S, head_dim] for attention
-        q = jnp.transpose(q, (0, 2, 1, 3))
-        k = jnp.transpose(k, (0, 2, 1, 3))
-        v = jnp.transpose(v, (0, 2, 1, 3))
+            # Use full cached K/V for attention
+            k_full = k_cache  # [B, max_seq_len, num_kv_heads, head_dim]
+            v_full = v_cache
+        else:
+            k_full = k
+            v_full = v
+
+        # Repeat KV heads for GQA: [B, kv_len, num_kv_heads, hd] -> [B, kv_len, num_heads, hd]
+        if self.num_kv_groups > 1:
+            k_full = jnp.repeat(k_full, self.num_kv_groups, axis=2)
+            v_full = jnp.repeat(v_full, self.num_kv_groups, axis=2)
+
+        # Transpose to [B, num_heads, *, head_dim] for attention
+        q = jnp.transpose(q, (0, 2, 1, 3))          # [B, num_heads, S, hd]
+        k_full = jnp.transpose(k_full, (0, 2, 1, 3))  # [B, num_heads, kv_len, hd]
+        v_full = jnp.transpose(v_full, (0, 2, 1, 3))
 
         # Scaled dot-product attention
-        attn_weights = jnp.matmul(q, jnp.swapaxes(k, -2, -1)) * self.scaling
+        # q: [B, H, S, hd], k_full: [B, H, kv_len, hd] -> [B, H, S, kv_len]
+        attn_weights = jnp.matmul(q, jnp.swapaxes(k_full, -2, -1)) * self.scaling
 
         if attention_mask is not None:
             attn_weights = attn_weights + attention_mask
 
-        attn_weights = jax.nn.softmax(attn_weights, axis=-1).astype(v.dtype)
-        attn_output = jnp.matmul(attn_weights, v)
+        attn_weights = jax.nn.softmax(attn_weights, axis=-1).astype(v_full.dtype)
+        attn_output = jnp.matmul(attn_weights, v_full)
 
         # Transpose back and reshape: [B, num_heads, S, hd] -> [B, S, num_heads * hd]
         attn_output = jnp.transpose(attn_output, (0, 2, 1, 3))
@@ -137,4 +165,4 @@ class GQAAttention(nnx.Module):
 
         # Output projection
         output = self.o_proj(attn_output)
-        return output
+        return output, kv_cache

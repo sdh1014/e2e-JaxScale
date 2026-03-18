@@ -20,7 +20,8 @@ import jax.numpy as jnp
 
 from configs.model_config import ModelConfig
 from models.glm4 import GLM4ForCausalLM
-from runner import make_causal_mask, make_positions
+from runner import make_causal_mask, make_decode_mask, make_positions, make_prefill_mask
+from layers.kv_cache import init_kv_caches
 from utils.mesh_utils import create_mesh
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -116,14 +117,14 @@ def benchmark_prefill(
 
     # Warmup (includes JIT compilation)
     for _ in range(warmup):
-        logits = model(input_ids, positions, mask)
+        logits, _ = model(input_ids, positions, mask)
         logits.block_until_ready()
 
     # Timed runs
     latencies = []
     for _ in range(repeats):
         t0 = time.perf_counter()
-        logits = model(input_ids, positions, mask)
+        logits, _ = model(input_ids, positions, mask)
         logits.block_until_ready()
         latencies.append(time.perf_counter() - t0)
 
@@ -151,44 +152,62 @@ def benchmark_decode(
     warmup: int = 2,
     repeats: int = 5,
 ) -> dict:
-    """Benchmark decode: simulate autoregressive generation without KV cache.
+    """Benchmark decode with KV Cache.
 
-    Each decode step does a full forward pass (current implementation has no KV cache).
-    Measures the per-step latency and throughput for the decode phase.
+    Prefills context_len tokens, then measures per-step decode latency
+    where each step only processes 1 new token using cached K/V.
     """
-    # Start with context_len tokens, then generate decode_steps tokens one at a time
+    config = model.config
+    max_cache_len = context_len + decode_steps + warmup + 1
+
     input_ids = jnp.ones((batch_size, context_len), dtype=jnp.int32)
 
-    # Warmup: simulate a few decode steps
-    for _ in range(warmup):
-        seq_len = input_ids.shape[1]
-        positions = make_positions(seq_len, batch_size)
-        mask = make_causal_mask(seq_len, dtype=dtype)
-        logits = model(input_ids, positions, mask)
+    def run_decode(num_steps):
+        """Run prefill + num_steps decode, return per-step latencies."""
+        kv_caches = init_kv_caches(
+            batch_size=batch_size,
+            max_seq_len=max_cache_len,
+            num_layers=config.num_hidden_layers,
+            num_kv_heads=config.num_key_value_heads,
+            head_dim=config.head_dim,
+            dtype=dtype,
+        )
+
+        # Prefill
+        positions = make_positions(context_len, batch_size)
+        cache_pos = jnp.arange(context_len, dtype=jnp.int32)
+        mask = make_prefill_mask(context_len, max_cache_len, dtype=dtype)
+        logits, kv_caches = model(
+            input_ids, positions, mask,
+            kv_caches=kv_caches, cache_position=cache_pos,
+        )
         logits.block_until_ready()
 
-    # Timed decode steps
-    step_latencies = []
-    current_ids = jnp.ones((batch_size, context_len), dtype=jnp.int32)
-
-    for step in range(decode_steps):
-        seq_len = current_ids.shape[1]
-        positions = make_positions(seq_len, batch_size)
-        mask = make_causal_mask(seq_len, dtype=dtype)
-
-        t0 = time.perf_counter()
-        logits = model(current_ids, positions, mask)
-        logits.block_until_ready()
-        elapsed = time.perf_counter() - t0
-
-        step_latencies.append(elapsed)
-
-        # Simulate appending a new token (just use token 1)
         next_token = jnp.ones((batch_size, 1), dtype=jnp.int32)
-        current_ids = jnp.concatenate([current_ids, next_token], axis=1)
+        step_latencies = []
+        for s in range(num_steps):
+            cur_pos = context_len + s
+            positions = jnp.full((batch_size, 1), cur_pos, dtype=jnp.int32)
+            cache_pos = jnp.array([cur_pos], dtype=jnp.int32)
+            mask = make_decode_mask(cur_pos, max_cache_len, dtype=dtype)
+
+            t0 = time.perf_counter()
+            logits, kv_caches = model(
+                next_token, positions, mask,
+                kv_caches=kv_caches, cache_position=cache_pos,
+            )
+            logits.block_until_ready()
+            step_latencies.append(time.perf_counter() - t0)
+
+        return step_latencies
+
+    # Warmup
+    run_decode(warmup)
+
+    # Timed runs
+    step_latencies = run_decode(decode_steps)
 
     avg_step_latency = sum(step_latencies) / len(step_latencies)
-    # Decode throughput: batch_size tokens generated per step
     throughput = batch_size / avg_step_latency
 
     return {
