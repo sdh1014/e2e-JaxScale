@@ -20,7 +20,7 @@ import jax.numpy as jnp
 
 from configs.model_config import ModelConfig
 from models.glm4 import GLM4ForCausalLM
-from runner import make_causal_mask, make_decode_mask, make_positions, make_prefill_mask
+from runner import JittedModel, make_causal_mask, make_decode_mask, make_positions, make_prefill_mask
 from layers.kv_cache import init_kv_caches
 from utils.mesh_utils import create_mesh
 
@@ -84,7 +84,9 @@ def get_peak_flops(device_type: str) -> float | None:
         "a100": 312,        # NVIDIA A100 SXM: 312 TFLOPS (bf16 TF32)
         "h100": 990,        # NVIDIA H100 SXM: 990 TFLOPS (bf16)
         "tpu v5e": 197,     # TPU v5e: 197 TFLOPS (bf16)
-        "tpu v6e": 410,     # TPU v6e: 410 TFLOPS (bf16) (Trillium)
+        "tpu v5": 197,      # alias
+        "tpu v6e": 918,     # TPU v6e: 918 TFLOPS (bf16) (Trillium, 4.7x v5e)
+        "tpu v6": 918,      # alias for "TPU v6 lite" etc.
     }
 
     device_type_lower = device_type.lower()
@@ -92,6 +94,57 @@ def get_peak_flops(device_type: str) -> float | None:
         if key in device_type_lower:
             return val * 1e12  # TFLOPS -> FLOPS
     return None
+
+
+def get_peak_bandwidth(device_type: str) -> float | None:
+    """Return theoretical peak HBM bandwidth (bytes/s) for known accelerators."""
+    peak_bw_gb_s = {
+        "l4": 300,          # NVIDIA L4: 300 GB/s (GDDR6)
+        "a100": 2039,       # NVIDIA A100 SXM: 2039 GB/s (HBM2e)
+        "h100": 3350,       # NVIDIA H100 SXM: 3350 GB/s (HBM3)
+        "tpu v5e": 800,     # TPU v5e: 800 GB/s (HBM)
+        "tpu v5": 800,      # alias
+        "tpu v6e": 1600,    # TPU v6e: 1600 GB/s (HBM, Trillium)
+        "tpu v6": 1600,     # alias for "TPU v6 lite" etc.
+    }
+
+    device_type_lower = device_type.lower()
+    for key, val in peak_bw_gb_s.items():
+        if key in device_type_lower:
+            return val * 1e9  # GB/s -> bytes/s
+    return None
+
+
+def estimate_model_size_bytes(config: ModelConfig, dtype: jnp.dtype) -> int:
+    """Estimate total model parameter size in bytes.
+
+    For decode MBU: each step must load all weights from HBM once.
+    """
+    bytes_per_param = 2 if dtype == jnp.bfloat16 else 4
+
+    h = config.hidden_size
+    n_kv = config.num_key_value_heads
+    n_q = config.num_attention_heads
+    head_dim = config.head_dim
+    i = config.intermediate_size
+    V = config.vocab_size
+    L = config.num_hidden_layers
+
+    # Per layer: attn (Q+K+V+O weights+bias) + MLP (gate+up+down) + 2 layernorms
+    attn_params = h * (n_q * head_dim) + h * (n_kv * head_dim) * 2 + (n_q * head_dim) * h
+    if config.attention_bias:
+        attn_params += n_q * head_dim + n_kv * head_dim * 2  # Q/K/V bias (no O bias)
+    mlp_params = h * i * 2 + i * h  # gate_up (fused) + down
+    norm_params = h * 2  # input_layernorm + post_attention_layernorm
+    per_layer = attn_params + mlp_params + norm_params
+
+    # Embedding + final norm + optional LM head
+    embedding = V * h
+    final_norm = h
+    lm_head = 0 if config.tie_word_embeddings else V * h
+
+    total_params = L * per_layer + embedding + final_norm + lm_head
+    return total_params * bytes_per_param
 
 
 # ---------------------------------------------------------------------------
@@ -152,15 +205,18 @@ def benchmark_decode(
     warmup: int = 2,
     repeats: int = 5,
 ) -> dict:
-    """Benchmark decode with KV Cache.
+    """Benchmark decode with KV Cache + JIT.
 
-    Prefills context_len tokens, then measures per-step decode latency
-    where each step only processes 1 new token using cached K/V.
+    Wraps model in JittedModel, precompiles, then measures per-step decode latency.
     """
     config = model.config
     max_cache_len = context_len + decode_steps + warmup + 1
 
     input_ids = jnp.ones((batch_size, context_len), dtype=jnp.int32)
+
+    # JIT-compile the model for decode
+    jitted = JittedModel(model)
+    jitted.warmup(batch_size=batch_size, prompt_len=context_len, max_cache_len=max_cache_len)
 
     def run_decode(num_steps):
         """Run prefill + num_steps decode, return per-step latencies."""
@@ -177,7 +233,7 @@ def benchmark_decode(
         positions = make_positions(context_len, batch_size)
         cache_pos = jnp.arange(context_len, dtype=jnp.int32)
         mask = make_prefill_mask(context_len, max_cache_len, dtype=dtype)
-        logits, kv_caches = model(
+        logits, kv_caches = jitted(
             input_ids, positions, mask,
             kv_caches=kv_caches, cache_position=cache_pos,
         )
@@ -192,7 +248,7 @@ def benchmark_decode(
             mask = make_decode_mask(cur_pos, max_cache_len, dtype=dtype)
 
             t0 = time.perf_counter()
-            logits, kv_caches = model(
+            logits, kv_caches = jitted(
                 next_token, positions, mask,
                 kv_caches=kv_caches, cache_position=cache_pos,
             )
@@ -250,6 +306,8 @@ def run_benchmark(
     # FLOPs calculation
     flops_per_token = estimate_flops_per_token(config)
     peak_flops = get_peak_flops(device_kind)
+    peak_bandwidth = get_peak_bandwidth(device_kind)
+    model_size_bytes = estimate_model_size_bytes(config, dtype)
 
     results = {
         "metadata": {
@@ -267,6 +325,9 @@ def run_benchmark(
             "dtype": str(dtype),
             "flops_per_token": flops_per_token,
             "peak_device_flops": peak_flops,
+            "peak_device_bandwidth": peak_bandwidth,
+            "model_size_bytes": model_size_bytes,
+            "model_size_gb": model_size_bytes / 1e9,
             "warmup_runs": warmup,
             "timed_runs": repeats,
         },
@@ -313,18 +374,28 @@ def run_benchmark(
 
             # Compute MFU for decode (per-step)
             if peak_flops is not None:
-                # Each decode step processes context_len + step tokens, approximate with context_len
-                avg_seq = context_len + decode_steps // 2
                 per_step_flops = flops_per_token * bs  # 1 new token per batch element
                 achieved_flops = per_step_flops / (result["avg_step_latency_ms"] / 1000)
                 result["mfu"] = achieved_flops / (peak_flops * num_devices)
 
+            # Compute MBU for decode (memory-bound metric)
+            # Decode is memory-bound: each step must read all model weights from HBM.
+            # MBU = achieved_bandwidth / peak_bandwidth
+            # achieved_bandwidth = model_size_bytes / step_latency (at batch=1)
+            # For batch > 1, weights are loaded once and reused, so bandwidth stays ~same.
+            if peak_bandwidth is not None:
+                achieved_bw = model_size_bytes / (result["avg_step_latency_ms"] / 1000)
+                result["mbu"] = achieved_bw / (peak_bandwidth * num_devices)
+                result["achieved_bandwidth_gb_s"] = achieved_bw / 1e9
+
             results["decode"].append(result)
+            mfu_str = f", MFU={result['mfu']:.2%}" if "mfu" in result else ""
+            mbu_str = f", MBU={result['mbu']:.2%}" if "mbu" in result else ""
             logger.info(
-                "  -> %.1f tok/s, step_latency=%.1f ms%s",
+                "  -> %.1f tok/s, step_latency=%.1f ms%s%s",
                 result["throughput_tok_per_sec"],
                 result["avg_step_latency_ms"],
-                f", MFU={result['mfu']:.2%}" if "mfu" in result else "",
+                mfu_str, mbu_str,
             )
         except Exception as e:
             logger.warning("  -> FAILED: %s", e)
@@ -348,6 +419,12 @@ def print_summary(results: dict):
     print("\n" + "=" * 80)
     print(f"BENCHMARK RESULTS: {meta['model_type']} | TP={meta['tp']} DP={meta['dp']} "
           f"| {meta['num_devices']}x {meta['device_kind']} | {meta['dtype']}")
+    if "model_size_gb" in meta:
+        print(f"  Model size: {meta['model_size_gb']:.1f} GB ({meta['dtype']})")
+    if meta.get("peak_device_flops"):
+        print(f"  Peak compute: {meta['peak_device_flops']/1e12:.0f} TFLOPS/device")
+    if meta.get("peak_device_bandwidth"):
+        print(f"  Peak bandwidth: {meta['peak_device_bandwidth']/1e9:.0f} GB/s/device")
     print("=" * 80)
 
     # Prefill table
@@ -365,18 +442,20 @@ def print_summary(results: dict):
               f"{mfu_str:>8}")
 
     # Decode table
-    print(f"\n{'DECODE':^80}")
+    print(f"\n{'DECODE (memory-bound → MBU is key metric)':^80}")
     print(f"{'Batch':>6} {'CtxLen':>7} {'Steps':>6} {'Step(ms)':>10} "
-          f"{'Tok/s':>10} {'MFU':>8}")
-    print("-" * 60)
+          f"{'Tok/s':>10} {'MFU':>8} {'MBU':>8} {'BW(GB/s)':>10}")
+    print("-" * 80)
     for r in results["decode"]:
         if "error" in r:
             print(f"{r['batch_size']:>6} {r['context_len']:>7} {'ERROR':>6}  {r['error']}")
             continue
         mfu_str = f"{r['mfu']:.2%}" if "mfu" in r else "N/A"
+        mbu_str = f"{r['mbu']:.2%}" if "mbu" in r else "N/A"
+        bw_str = f"{r['achieved_bandwidth_gb_s']:.0f}" if "achieved_bandwidth_gb_s" in r else "N/A"
         print(f"{r['batch_size']:>6} {r['context_len']:>7} {r['decode_steps']:>6} "
               f"{r['avg_step_latency_ms']:>10.1f} {r['throughput_tok_per_sec']:>10.1f} "
-              f"{mfu_str:>8}")
+              f"{mfu_str:>8} {mbu_str:>8} {bw_str:>10}")
 
     print("=" * 80)
 

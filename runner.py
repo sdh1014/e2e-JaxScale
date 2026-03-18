@@ -396,7 +396,7 @@ def greedy_generate_no_cache(
     for _ in range(max_new_tokens):
         seq_len = current_ids.shape[1]
         positions = make_positions(seq_len, current_ids.shape[0])
-        mask = make_causal_mask(seq_len, dtype=jnp.bfloat16)
+        mask = make_causal_mask(seq_len, dtype=model.dtype)
 
         logits, _ = model(current_ids, positions, mask)
         next_token = jnp.argmax(logits[:, -1, :], axis=-1, keepdims=True)
