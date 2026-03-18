@@ -227,6 +227,7 @@ def benchmark_decode(
             num_kv_heads=config.num_key_value_heads,
             head_dim=config.head_dim,
             dtype=dtype,
+            mesh=getattr(model, 'mesh', None),
         )
 
         # Prefill
@@ -558,6 +559,10 @@ def main():
             model = GLM4ForCausalLM(config, mesh, dtype=dtype)
             model.load_weights(config)
 
+            if tp > 1:
+                from utils.weight_utils import shard_model_params
+                shard_model_params(model, mesh)
+
             result = run_benchmark(
                 model, config, tp, dp, dtype,
                 batch_sizes=args.batch_sizes,
@@ -588,6 +593,11 @@ def main():
         t0 = time.time()
         model.load_weights(config)
         logger.info("Weights loaded in %.2fs", time.time() - t0)
+
+        if args.tp > 1:
+            from utils.weight_utils import shard_model_params
+            logger.info("Sharding params for TP=%d...", args.tp)
+            shard_model_params(model, mesh)
 
         result = run_benchmark(
             model, config, args.tp, args.dp, dtype,

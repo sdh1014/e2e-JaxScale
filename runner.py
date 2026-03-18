@@ -78,8 +78,13 @@ def make_positions(seq_len: int, batch_size: int = 1) -> jax.Array:
 # ---------------------------------------------------------------------------
 
 def _init_caches(model, batch_size: int, max_cache_len: int):
-    """Create empty KV caches from model config."""
+    """Create empty KV caches from model config.
+
+    When the model has a mesh with TP > 1, KV caches are sharded
+    along the num_kv_heads dimension.
+    """
     config = model.config
+    mesh = getattr(model, 'mesh', None)
     return init_kv_caches(
         batch_size=batch_size,
         max_seq_len=max_cache_len,
@@ -87,6 +92,7 @@ def _init_caches(model, batch_size: int, max_cache_len: int):
         num_kv_heads=config.num_key_value_heads,
         head_dim=config.head_dim,
         dtype=model.dtype,
+        mesh=mesh,
     )
 
 
@@ -110,6 +116,7 @@ class JittedModel:
     def __init__(self, model):
         self.config = model.config
         self.dtype = model.dtype
+        self.mesh = getattr(model, 'mesh', None)
 
         # NNX split: separate graph structure from parameter state
         model_def, model_state = nnx.split(model)

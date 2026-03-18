@@ -9,6 +9,8 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 
 @dataclass
@@ -38,11 +40,22 @@ def init_kv_caches(
     num_kv_heads: int,
     head_dim: int,
     dtype: jnp.dtype = jnp.bfloat16,
+    mesh: jax.sharding.Mesh | None = None,
 ) -> list[KVCache]:
-    """Pre-allocate KV caches for all layers, initialized to zeros."""
+    """Pre-allocate KV caches for all layers, initialized to zeros.
+
+    With TP, the num_kv_heads dimension is sharded across the "tensor" axis.
+    """
     caches = []
     for _ in range(num_layers):
         k = jnp.zeros((batch_size, max_seq_len, num_kv_heads, head_dim), dtype=dtype)
         v = jnp.zeros((batch_size, max_seq_len, num_kv_heads, head_dim), dtype=dtype)
+
+        # Shard KV cache along num_kv_heads for TP
+        if mesh is not None:
+            sharding = NamedSharding(mesh, P(None, None, "tensor", None))
+            k = jax.device_put(k, sharding)
+            v = jax.device_put(v, sharding)
+
         caches.append(KVCache(k=k, v=v))
     return caches

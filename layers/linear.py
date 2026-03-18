@@ -53,13 +53,28 @@ class LinearBase(nnx.Module):
             self.bias = None
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        """Forward pass. Returns output tensor."""
+        """Forward pass. Returns output tensor.
+
+        Applies sharding constraint on the output based on kernel_axes:
+        - Column-parallel (None, "tensor"): output last dim sharded by "tensor"
+        - Row-parallel ("tensor", None): output replicated (implicit all-reduce)
+        """
         output = lax.dot_general(
             x,
             self.weight.value,
             (((x.ndim - 1,), (0,)), ((), ())),
             preferred_element_type=self.params_dtype,
         )
+
+        # Constrain output sharding for TP
+        if self.mesh is not None and any(a is not None for a in self.kernel_axes):
+            # kernel_axes[1] is the output dimension's sharding axis
+            out_axis = self.kernel_axes[1]
+            out_pspec = P(*([None] * (output.ndim - 1)), out_axis)
+            output = jax.lax.with_sharding_constraint(
+                output, NamedSharding(self.mesh, out_pspec)
+            )
+
         if self.bias is not None:
             output = output + self.bias.value
         return output

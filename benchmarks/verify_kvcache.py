@@ -53,6 +53,7 @@ def verify_prefill_equivalence(model, config, prompt_len=32, dtype=jnp.bfloat16)
         num_kv_heads=config.num_key_value_heads,
         head_dim=config.head_dim,
         dtype=dtype,
+        mesh=getattr(model, 'mesh', None),
     )
     cache_position = jnp.arange(prompt_len, dtype=jnp.int32)
     mask_cached = make_prefill_mask(prompt_len, max_cache_len, dtype=dtype)

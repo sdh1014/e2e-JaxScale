@@ -145,6 +145,7 @@ class GLM4Model(nnx.Module):
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
             dtype=dtype,
+            mesh=mesh,
         )
 
         self.layers = nnx.List([
@@ -217,6 +218,7 @@ class GLM4ForCausalLM(nnx.Module):
                 vocab_size=config.vocab_size,
                 hidden_size=config.hidden_size,
                 dtype=dtype,
+                mesh=mesh,
             )
         else:
             self.lm_head = None

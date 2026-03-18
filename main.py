@@ -61,6 +61,14 @@ def main():
     model.load_weights(config)
     logger.info("Weights loaded in %.2fs", time.time() - t0)
 
+    # Shard weights across TP devices
+    if args.tp > 1:
+        from utils.weight_utils import shard_model_params
+        logger.info("Sharding model params for TP=%d ...", args.tp)
+        t0 = time.time()
+        shard_model_params(model, mesh)
+        logger.info("Params sharded in %.2fs", time.time() - t0)
+
     # Benchmark mode
     if args.benchmark:
         from benchmarks.benchmark import run_benchmark, print_summary

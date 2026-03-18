@@ -9,6 +9,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from safetensors import safe_open
 
 from configs.model_config import ModelConfig
@@ -154,3 +156,81 @@ class WeightLoader:
             current.value = jnp.asarray(value_np, dtype=self.dtype)
         else:
             setattr(obj, final_attr, nnx.Param(jnp.asarray(value_np, dtype=self.dtype)))
+
+
+def shard_model_params(model, mesh: jax.sharding.Mesh):
+    """Apply TP sharding to all model parameters based on kernel_axes.
+
+    Must be called after load_weights(). Walks the model tree and uses
+    jax.device_put to distribute each LinearBase weight (and bias) according
+    to its kernel_axes PartitionSpec. Embedding weights are replicated.
+
+    Args:
+        model: GLM4ForCausalLM instance with weights already loaded.
+        mesh: JAX device mesh (must have a "tensor" axis for TP).
+    """
+    from layers.linear import LinearBase
+
+    tp_size = mesh.shape.get("tensor", 1)
+    if tp_size <= 1:
+        logger.info("TP size is 1, skipping weight sharding")
+        return
+
+    sharded_count = 0
+
+    for layer in model.model.layers:
+        # Attention projections
+        for proj in [layer.self_attn.q_proj, layer.self_attn.k_proj,
+                     layer.self_attn.v_proj, layer.self_attn.o_proj]:
+            _shard_linear(proj, mesh)
+            sharded_count += 1
+
+        # MLP projections
+        for proj in [layer.mlp.gate_proj, layer.mlp.up_proj, layer.mlp.down_proj]:
+            _shard_linear(proj, mesh)
+            sharded_count += 1
+
+    # Embedding and LMHead: replicate (P(None, None))
+    replicated = NamedSharding(mesh, P(None, None))
+    model.model.embed_tokens.embedding.value = jax.device_put(
+        model.model.embed_tokens.embedding.value, replicated
+    )
+    if model.lm_head is not None:
+        model.lm_head.embedding.value = jax.device_put(
+            model.lm_head.embedding.value, replicated
+        )
+
+    # RMSNorm scales: replicate (P(None))
+    replicated_1d = NamedSharding(mesh, P(None))
+    model.model.norm.scale.value = jax.device_put(
+        model.model.norm.scale.value, replicated_1d
+    )
+    for layer in model.model.layers:
+        layer.input_layernorm.scale.value = jax.device_put(
+            layer.input_layernorm.scale.value, replicated_1d
+        )
+        layer.post_attention_layernorm.scale.value = jax.device_put(
+            layer.post_attention_layernorm.scale.value, replicated_1d
+        )
+
+    logger.info("Sharded %d linear layers across TP=%d devices", sharded_count, tp_size)
+
+
+def _shard_linear(linear, mesh: jax.sharding.Mesh):
+    """Apply TP sharding to a single LinearBase module's parameters.
+
+    Weight PartitionSpec comes directly from kernel_axes:
+      - Column-parallel (None, "tensor"): output dim sharded
+      - Row-parallel ("tensor", None): input dim sharded
+    """
+    weight_pspec = P(*linear.kernel_axes)
+    weight_sharding = NamedSharding(mesh, weight_pspec)
+    linear.weight.value = jax.device_put(linear.weight.value, weight_sharding)
+
+    if linear.bias is not None:
+        # Bias shape: (output_size,)
+        # Column-parallel: bias sharded by "tensor"
+        # Row-parallel: bias replicated (kernel_axes[1] is None)
+        bias_pspec = P(linear.kernel_axes[1])
+        bias_sharding = NamedSharding(mesh, bias_pspec)
+        linear.bias.value = jax.device_put(linear.bias.value, bias_sharding)
