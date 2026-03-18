@@ -28,6 +28,7 @@ def main():
     parser.add_argument("--tp", type=int, default=1, help="Tensor parallelism degree")
     parser.add_argument("--dp", type=int, default=1, help="Data parallelism degree")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float32"])
+    parser.add_argument("--benchmark", action="store_true", help="Run benchmark instead of generation")
     args = parser.parse_args()
 
     dtype = jnp.bfloat16 if args.dtype == "bfloat16" else jnp.float32
@@ -59,6 +60,18 @@ def main():
     t0 = time.time()
     model.load_weights(config)
     logger.info("Weights loaded in %.2fs", time.time() - t0)
+
+    # Benchmark mode
+    if args.benchmark:
+        from benchmark import run_benchmark, print_summary
+        result = run_benchmark(
+            model, config, args.tp, args.dp, dtype,
+            batch_sizes=[1],
+            seq_lens=[128, 256, 512],
+            decode_steps=8,
+        )
+        print_summary(result)
+        return
 
     # Tokenize with chat template
     from transformers import AutoTokenizer
