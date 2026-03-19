@@ -30,6 +30,11 @@ def main():
     parser.add_argument("--ep", type=int, default=1, help="Expert parallelism degree (MoE only)")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float32"])
     parser.add_argument("--benchmark", action="store_true", help="Run benchmark instead of generation")
+    parser.add_argument("--sample", action="store_true", help="Use sampling instead of greedy decode")
+    parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature")
+    parser.add_argument("--top_p", type=float, default=0.8, help="Top-p (nucleus) sampling threshold")
+    parser.add_argument("--top_k", type=int, default=0, help="Top-k sampling (0=disabled)")
+    parser.add_argument("--repetition_penalty", type=float, default=1.1, help="Repetition penalty (1.0=disabled)")
     args = parser.parse_args()
 
     dtype = jnp.bfloat16 if args.dtype == "bfloat16" else jnp.float32
@@ -124,14 +129,34 @@ def main():
     max_cache_len = seq_len + args.max_new_tokens
     jitted_model.warmup(batch_size=1, prompt_len=seq_len, max_cache_len=max_cache_len)
 
+    # Use all EOS token IDs from generation_config (GLM-4 has 3)
+    eos_token_ids = getattr(model.config, 'eos_token_id', None) or tokenizer.eos_token_id
+    logger.info("EOS token IDs: %s", eos_token_ids)
+
     t0 = time.time()
-    output_ids = greedy_generate(
-        jitted_model,
-        input_ids,
-        max_new_tokens=args.max_new_tokens,
-        max_cache_len=max_cache_len,
-        eos_token_id=tokenizer.eos_token_id,
-    )
+    if args.sample:
+        from runner import sample_generate
+        logger.info("Generating (sample, T=%.1f, top_p=%.1f, top_k=%d, rep_pen=%.1f)...",
+                     args.temperature, args.top_p, args.top_k, args.repetition_penalty)
+        output_ids = sample_generate(
+            jitted_model,
+            input_ids,
+            max_new_tokens=args.max_new_tokens,
+            max_cache_len=max_cache_len,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            repetition_penalty=args.repetition_penalty,
+            eos_token_id=eos_token_ids,
+        )
+    else:
+        output_ids = greedy_generate(
+            jitted_model,
+            input_ids,
+            max_new_tokens=args.max_new_tokens,
+            max_cache_len=max_cache_len,
+            eos_token_id=eos_token_ids,
+        )
     gen_time = time.time() - t0
 
     # Decode

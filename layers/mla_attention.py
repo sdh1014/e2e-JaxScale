@@ -182,7 +182,7 @@ class MLAAttention(nnx.Module):
         if attention_mask is not None:
             attn_weights = attn_weights + attention_mask
 
-        attn_weights = jax.nn.softmax(attn_weights, axis=-1).astype(v_full.dtype)
+        attn_weights = jax.nn.softmax(attn_weights.astype(jnp.float32), axis=-1).astype(v_full.dtype)
         attn_output = jnp.matmul(attn_weights, v_full)  # [B, H, S, v_head_dim]
 
         # Reshape back: [B, H, S, v] → [B, S, H*v]

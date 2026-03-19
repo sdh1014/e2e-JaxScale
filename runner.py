@@ -242,7 +242,7 @@ def greedy_generate(
     input_ids: jax.Array,
     max_new_tokens: int = 128,
     max_cache_len: int | None = None,
-    eos_token_id: int | None = None,
+    eos_token_id: int | list[int] | None = None,
 ) -> jax.Array:
     """Greedy generation with KV Cache.
 
@@ -255,6 +255,7 @@ def greedy_generate(
         max_new_tokens: Max number of tokens to generate.
         max_cache_len: Pre-allocated cache length. Defaults to prompt_len + max_new_tokens.
         eos_token_id: Stop generation when this token is produced.
+            Can be a single int or a list of ints (e.g. GLM-4 has 3 EOS tokens).
 
     Returns:
         generated_ids: [batch, prompt_len + generated_len]
@@ -297,10 +298,65 @@ def greedy_generate(
         generated.append(next_token)
 
         if eos_token_id is not None:
-            if jnp.all(next_token == eos_token_id):
+            if isinstance(eos_token_id, int):
+                hit = jnp.all(next_token == eos_token_id)
+            else:
+                hit = jnp.all(jnp.isin(next_token, jnp.array(eos_token_id)))
+            if hit:
                 break
 
     return jnp.concatenate([input_ids] + generated, axis=1)
+
+
+# ---------------------------------------------------------------------------
+# Sampling helpers
+# ---------------------------------------------------------------------------
+
+@partial(jax.jit, static_argnames=["temperature", "top_k", "top_p"])
+def _jit_sample(
+    logits: jax.Array,
+    presence: jax.Array,
+    rng_key: jax.Array,
+    repetition_penalty: float,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+) -> tuple[jax.Array, jax.Array]:
+    """JIT-compiled sampling: penalty → temperature → top_k → top_p → categorical.
+
+    Top-p is applied AFTER top-k on the reduced candidate set for efficiency.
+    This avoids sorting the full vocab (155K) — only sorts top_k candidates.
+    """
+    batch_size = logits.shape[0]
+
+    # 1. Repetition penalty
+    penalized = jnp.where(logits > 0, logits / repetition_penalty, logits * repetition_penalty)
+    logits = jnp.where(presence, penalized, logits)
+
+    # 2. Temperature
+    if temperature != 1.0:
+        logits = logits / temperature
+
+    # 3. Top-k: reduce to k candidates (default 200 when only top_p is used)
+    effective_k = top_k if top_k > 0 else 200
+    top_k_vals, top_k_idx = jax.lax.top_k(logits, effective_k)  # [B, k]
+
+    # 4. Top-p on the reduced set (sort k elements instead of 155K)
+    if top_p < 1.0:
+        sorted_order = jnp.argsort(-top_k_vals, axis=-1)
+        sorted_vals = jnp.take_along_axis(top_k_vals, sorted_order, axis=-1)
+        probs = jax.nn.softmax(sorted_vals.astype(jnp.float32), axis=-1)
+        cum_probs = jnp.cumsum(probs, axis=-1)
+        mask = (cum_probs - probs) >= top_p
+        sorted_vals = jnp.where(mask, -1e9, sorted_vals)
+        unsort_order = jnp.argsort(sorted_order, axis=-1)
+        top_k_vals = jnp.take_along_axis(sorted_vals, unsort_order, axis=-1)
+
+    # 5. Sample from the k candidates
+    rng_key, sample_key = jax.random.split(rng_key)
+    selected = jax.random.categorical(sample_key, top_k_vals, axis=-1)
+    token = top_k_idx[jnp.arange(batch_size), selected]
+    return token[:, None], rng_key
 
 
 # ---------------------------------------------------------------------------
@@ -312,21 +368,29 @@ def sample_generate(
     input_ids: jax.Array,
     max_new_tokens: int = 128,
     max_cache_len: int | None = None,
-    temperature: float = 0.7,
-    top_k: int = 50,
-    eos_token_id: int | None = None,
+    temperature: float = 0.8,
+    top_k: int = 0,
+    top_p: float = 0.8,
+    repetition_penalty: float = 1.1,
+    eos_token_id: int | list[int] | None = None,
     rng_key: jax.Array | None = None,
 ) -> jax.Array:
-    """Sampling generation with KV Cache, temperature and top-k.
+    """Sampling generation with KV Cache, temperature, top-k, top-p, and repetition penalty.
+
+    Sampling logic is JIT-compiled separately from the model forward pass.
+    Repetition penalty presence mask is maintained on the host (numpy) side
+    to avoid dynamic shapes inside JIT.
 
     Args:
         model: GLM4ForCausalLM instance.
         input_ids: [batch, prompt_len]
         max_new_tokens: Max new tokens.
-        max_cache_len: Pre-allocated cache length. Defaults to prompt_len + max_new_tokens.
-        temperature: Sampling temperature.
-        top_k: Top-k filtering.
-        eos_token_id: Stop token.
+        max_cache_len: Pre-allocated cache length.
+        temperature: Sampling temperature (>0). Lower = more deterministic.
+        top_k: Top-k filtering. 0 = disabled.
+        top_p: Nucleus sampling threshold. 1.0 = disabled.
+        repetition_penalty: Penalty for repeated tokens. 1.0 = disabled, >1.0 = penalize.
+        eos_token_id: Stop token(s).
         rng_key: JAX random key for sampling.
 
     Returns:
@@ -338,6 +402,13 @@ def sample_generate(
     batch_size, prompt_len = input_ids.shape
     if max_cache_len is None:
         max_cache_len = prompt_len + max_new_tokens
+
+    # Repetition penalty: maintain presence mask on device [B, vocab_size]
+    vocab_size = model.config.vocab_size
+    presence = jnp.zeros((batch_size, vocab_size), dtype=jnp.float32)
+    # Mark prompt tokens as present
+    batch_idx = jnp.arange(batch_size)[:, None]
+    presence = presence.at[batch_idx, input_ids].set(1.0)
 
     # 1. Init KV Cache
     kv_caches = _init_caches(model, batch_size, max_cache_len)
@@ -352,23 +423,13 @@ def sample_generate(
         kv_caches=kv_caches, cache_position=cache_position,
     )
 
-    next_logits = logits[:, -1, :]
-
-    def _sample_token(next_logits, rng_key):
-        if temperature > 0:
-            next_logits = next_logits / temperature
-        if top_k > 0:
-            top_k_logits, top_k_indices = jax.lax.top_k(next_logits, top_k)
-            next_logits = jnp.full_like(next_logits, -1e9)
-            next_logits = next_logits.at[
-                jnp.arange(next_logits.shape[0])[:, None], top_k_indices
-            ].set(top_k_logits)
-        rng_key, sample_key = jax.random.split(rng_key)
-        token = jax.random.categorical(sample_key, next_logits, axis=-1)
-        return token[:, None], rng_key
-
-    next_token, rng_key = _sample_token(next_logits, rng_key)
+    # Sample first token
+    next_token, rng_key = _jit_sample(
+        logits[:, -1, :], presence, rng_key,
+        repetition_penalty, temperature, top_k, top_p,
+    )
     generated = [next_token]
+    presence = presence.at[jnp.arange(batch_size), next_token[:, 0]].set(1.0)
 
     # 3. Decode
     for step in range(max_new_tokens - 1):
@@ -383,11 +444,19 @@ def sample_generate(
             kv_caches=kv_caches, cache_position=cache_position,
         )
 
-        next_token, rng_key = _sample_token(logits[:, -1, :], rng_key)
+        next_token, rng_key = _jit_sample(
+            logits[:, -1, :], presence, rng_key,
+            repetition_penalty, temperature, top_k, top_p,
+        )
         generated.append(next_token)
+        presence = presence.at[jnp.arange(batch_size), next_token[:, 0]].set(1.0)
 
         if eos_token_id is not None:
-            if jnp.all(next_token == eos_token_id):
+            if isinstance(eos_token_id, int):
+                hit = jnp.all(next_token == eos_token_id)
+            else:
+                hit = jnp.all(jnp.isin(next_token, jnp.array(eos_token_id)))
+            if hit:
                 break
 
     return jnp.concatenate([input_ids] + generated, axis=1)
@@ -401,7 +470,7 @@ def greedy_generate_no_cache(
     model,
     input_ids: jax.Array,
     max_new_tokens: int = 128,
-    eos_token_id: int | None = None,
+    eos_token_id: int | list[int] | None = None,
 ) -> jax.Array:
     """Greedy generation WITHOUT KV Cache (for validation).
 
@@ -420,7 +489,11 @@ def greedy_generate_no_cache(
         current_ids = jnp.concatenate([current_ids, next_token], axis=1)
 
         if eos_token_id is not None:
-            if jnp.all(next_token == eos_token_id):
+            if isinstance(eos_token_id, int):
+                hit = jnp.all(next_token == eos_token_id)
+            else:
+                hit = jnp.all(jnp.isin(next_token, jnp.array(eos_token_id)))
+            if hit:
                 break
 
     return current_ids

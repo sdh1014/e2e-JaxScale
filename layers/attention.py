@@ -139,28 +139,20 @@ class GQAAttention(nnx.Module):
             k_full = k
             v_full = v
 
-        # Repeat KV heads for GQA: [B, kv_len, num_kv_heads, hd] -> [B, kv_len, num_heads, hd]
-        if self.num_kv_groups > 1:
-            k_full = jnp.repeat(k_full, self.num_kv_groups, axis=2)
-            v_full = jnp.repeat(v_full, self.num_kv_groups, axis=2)
+        # Scaled dot-product attention via JAX native implementation.
+        # Handles GQA natively (num_kv_heads != num_heads), computes in fp32
+        # internally, and supports causal masking.
+        # q: [B, S, num_heads, hd], k/v: [B, kv_len, num_kv_heads, hd]
 
-        # Transpose to [B, num_heads, *, head_dim] for attention
-        q = jnp.transpose(q, (0, 2, 1, 3))          # [B, num_heads, S, hd]
-        k_full = jnp.transpose(k_full, (0, 2, 1, 3))  # [B, num_heads, kv_len, hd]
-        v_full = jnp.transpose(v_full, (0, 2, 1, 3))
+        # Convert additive mask to bias format for dot_product_attention
+        attn_output = jax.nn.dot_product_attention(
+            q, k_full, v_full,
+            bias=attention_mask,
+            scale=self.scaling,
+            implementation="xla",
+        )
 
-        # Scaled dot-product attention
-        # q: [B, H, S, hd], k_full: [B, H, kv_len, hd] -> [B, H, S, kv_len]
-        attn_weights = jnp.matmul(q, jnp.swapaxes(k_full, -2, -1)) * self.scaling
-
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-
-        attn_weights = jax.nn.softmax(attn_weights, axis=-1).astype(v_full.dtype)
-        attn_output = jnp.matmul(attn_weights, v_full)
-
-        # Transpose back and reshape: [B, num_heads, S, hd] -> [B, S, num_heads * hd]
-        attn_output = jnp.transpose(attn_output, (0, 2, 1, 3))
+        # Reshape: [B, S, num_heads, hd] -> [B, S, num_heads * hd]
         attn_output = attn_output.reshape(batch, seq_len, -1)
 
         # Output projection

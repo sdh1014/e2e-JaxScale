@@ -53,6 +53,7 @@ class ModelConfig:
     # --- Runtime ---
     model_path: str = ""
     model_type: str = "glm"
+    eos_token_id: int | list[int] | None = None
 
     def __post_init__(self):
         if self.head_dim is None:
@@ -84,6 +85,14 @@ class ModelConfig:
         for key, value in raw.items():
             if key in known_fields:
                 kwargs[key] = value
+
+        # Load EOS token IDs from generation_config.json if available
+        gen_config_path = os.path.join(model_path, "generation_config.json")
+        if os.path.exists(gen_config_path):
+            with open(gen_config_path) as f:
+                gen_raw = json.load(f)
+            if "eos_token_id" in gen_raw:
+                kwargs["eos_token_id"] = gen_raw["eos_token_id"]
 
         kwargs["model_path"] = model_path
         return cls(**kwargs)
