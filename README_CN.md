@@ -1,6 +1,6 @@
 # JaxScale
 
-**从零构建的 JAX/Flax LLM 推理框架，用于学习和性能分析。**
+**从零构建的 JAX/Flax LLM 推理框架，用于学习和性能分析。实现参考了 [sglang-jax](https://github.com/sgl-project/sglang-jax)。**
 
 [English](README.md)
 

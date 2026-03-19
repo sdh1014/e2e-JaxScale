@@ -1,6 +1,6 @@
 # JaxScale
 
-**A JAX/Flax-based LLM inference framework built from scratch for learning and performance analysis.**
+**A JAX/Flax-based LLM inference framework built from scratch for learning and performance analysis, inspired by [sglang-jax](https://github.com/sgl-project/sglang-jax).**
 
 [中文版](README_CN.md)
 
