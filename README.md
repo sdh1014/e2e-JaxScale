@@ -11,7 +11,7 @@ JaxScale implements complete inference pipelines for GLM-family models on JAX/Fl
 | Model | Architecture | Parameters | Attention | FFN |
 |-------|-------------|-----------|-----------|-----|
 | **GLM-4-9B** | Dense Transformer | 9B (18 GB bf16) | GQA (32Q / 2KV) | SwiGLU |
-| **GLM-4.7-Flash** | MoE Transformer | 62B total / 3B active (bf16) | MLA | 64 routed + 1 shared expert |
+| **GLM-4.7-Flash** | MoE Transformer | 30B total / 3B active (bf16) | MLA | 64 routed + 1 shared expert |
 
 ## Key Features
 
